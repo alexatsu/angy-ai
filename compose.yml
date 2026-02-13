@@ -1,0 +1,19 @@
+services:
+    nebula-bot:
+        build: . # This tells compose to build using the Dockerfile
+        image: angy-ai-dev-i # Optional: names the built image
+        container_name: angy-ai-dev-c # Sets the container name
+        env_file:
+            - .env
+        restart:
+            unless-stopped
+            # Remove tty: true as it can cause duplication
+        tty: false # ← Disable TTY (no pseudo-terminal)
+        stdin_open: false # ← Disable unused stdin
+        logging:
+            driver: "json-file" # ← Default, but ensures no duplication
+            options:
+                max-size: "10m"
+                mode: non-blocking # ← Prevents log buffering issues
+        networks:
+            - angy-ai-dev-network
