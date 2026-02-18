@@ -4,7 +4,7 @@ import 'dotenv/config'
 
 // import { initAiStudio } from '@/aistudio'
 import { initCommands } from '@/commands'
-import 'bot'
+import 'test'
 
 // async function main() {
 //     const app = new Hono()
@@ -23,5 +23,5 @@ import 'bot'
 // }
 
 // await main()
-await initCommands()
+// await initCommands()
 // await initAiStudio()

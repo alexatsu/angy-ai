@@ -1,4 +1,4 @@
-import type { CommandInteraction } from 'discord.js'
+import type { CommandInteraction, GuildMember } from 'discord.js'
 
 import { joinVoiceChannel, getVoiceConnection } from '@discordjs/voice'
 import { Client, Events, GatewayIntentBits, type CacheType } from 'discord.js'
@@ -18,7 +18,7 @@ client.once(Events.ClientReady, readyClient => {
     console.log(`Ready! Logged in as ${readyClient.user.tag}`)
 })
 
-client.on('interactionCreate', async interaction => {
+client.on(Events.InteractionCreate, async interaction => {
     if (!interaction.isChatInputCommand()) return
 
     if (interaction.commandName === 'join') {
@@ -29,7 +29,8 @@ client.on('interactionCreate', async interaction => {
 })
 
 async function handleJoin(interaction: CommandInteraction<CacheType>) {
-    const voiceChannel = interaction.member?.voice.channel
+    const member = interaction.member as GuildMember
+    const voiceChannel = member.voice.channel
 
     if (!voiceChannel) {
         return interaction.reply('Please join a voice channel first!')
@@ -45,6 +46,8 @@ async function handleJoin(interaction: CommandInteraction<CacheType>) {
             channelId: voiceChannel.id,
             guildId: voiceChannel.guild.id,
             adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+            selfMute: false,
+            selfDeaf: false,
         })
 
         connections.set(voiceChannel.guild.id, connection)
