@@ -303,7 +303,7 @@ function startAudioReceiving(connection: VoiceConnection, guildId: string) {
         audioStreams.set(guildId, streams)
 
         // Process the audio stream
-        await processAudioStream(audioStream, guildId, userId)
+        await processAudioStream(audioStream)
     })
 
     receiver.speaking.on('end', (userId: string) => {
@@ -311,11 +311,7 @@ function startAudioReceiving(connection: VoiceConnection, guildId: string) {
     })
 }
 
-async function processAudioStream(
-    audioStream: AudioReceiveStream,
-    guildId: string,
-    userId: string,
-) {
+async function processAudioStream(audioStream: AudioReceiveStream) {
     try {
         // Convert Opus to PCM
         const decoder = new prism.opus.Decoder({
