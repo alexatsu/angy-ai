@@ -39,10 +39,10 @@ export default defineConfig(
             '@typescript-eslint/await-thenable': 'error',
 
             // General
-            'no-console': ['warn', { allow: ['warn', 'error'] }],
+            // 'no-console': ['warn', { allow: ['warn', 'error'] }],
             'prefer-const': 'error',
             'object-shorthand': 'error',
-            'prefer-template': 'error',
+            // 'prefer-template': 'error',
             '@typescript-eslint/no-misused-promises': [0],
             'perfectionist/sort-imports': 'error',
         },
