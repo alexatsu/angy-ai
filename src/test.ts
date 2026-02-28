@@ -1,7 +1,8 @@
 import type { VoiceConnection } from '@discordjs/voice'
 import type { LiveServerMessage, Session } from '@google/genai'
 import type { CommandInteraction, GuildMember } from 'discord.js'
-
+import { Readable, Writable, PassThrough } from 'stream'
+import { StreamType } from '@discordjs/voice'
 import {
     joinVoiceChannel,
     getVoiceConnection,
@@ -17,7 +18,6 @@ import { spawn } from 'child_process'
 import { Client, Events, GatewayIntentBits, type CacheType } from 'discord.js'
 import { readFileSync, unlinkSync, writeFileSync } from "fs"
 import prism from 'prism-media'
-import { Readable, Writable } from 'stream'
 import { pipeline } from 'stream/promises'
 
 // AI Session Management
@@ -25,77 +25,81 @@ let session: Session | undefined = undefined
 
 // Audio processing queues
 let isProcessing = false
+let aiInputStream: PassThrough | undefined = undefined
 
 async function handleModelTurn(message: LiveServerMessage) {
-    if (message.serverContent?.modelTurn?.parts) {
-        for (const part of message.serverContent.modelTurn.parts) {
-            if (part?.inlineData) {
-                const audioBuffer = Buffer.from(part.inlineData.data, 'base64');
+    const parts = message.serverContent?.modelTurn?.parts
+    if (!parts) return
 
-                console.log('AI sent audio response:', {
-                    mimeType: part.inlineData.mimeType,
-                    size: audioBuffer.length
-                });
+    for (const part of parts) {
+        if (part.inlineData) {
+            // Gemini sends audio as base64
+            const audioBuffer = Buffer.from(part.inlineData.data, 'base64');
 
-                // Convert AI's audio to Discord format
-                const discordAudio = await convertAiAudioToDiscord(audioBuffer);
-                playAudioResponse(discordAudio);
-            } else if (part?.text) {
-                console.log('AI sent text response:', part.text);
+            // Get the current guild state (assuming 1 active connection for simplicity)
+            // In production, map this by guildId
+            const guildId = Array.from(connections.keys())[0];
+            if (!guildId) return;
+            const guildState = connections.get(guildId);
+
+            if (guildState) {
+                playStreamingAudio(guildState, audioBuffer);
             }
+
+        } else if (part.text) {
+            console.log('AI sent text response:', part.text);
         }
     }
 }
 
-async function convertAiAudioToDiscord(aiAudioBuffer: Buffer): Promise<Buffer> {
-    // Save to temp file
-    const inputPath = `temp_ai_${Date.now()}.raw`;
-    const outputPath = `temp_discord_${Date.now()}.wav`;
+function playStreamingAudio(guildState: GuildConnectionState, chunk: Buffer) {
+    // 1. If we don't have an active stream, create the pipeline
+    if (!aiInputStream) {
+        console.log("Starting new AI audio stream...");
 
-    writeFileSync(inputPath, aiAudioBuffer);
+        // Create a generic stream to accept Gemini chunks
+        aiInputStream = new PassThrough();
 
-    return new Promise((resolve, reject) => {
-        // Try to detect if it's WAV or raw PCM
-        const isWav = aiAudioBuffer.toString('ascii', 0, 4) === 'RIFF';
-
-        const ffmpegArgs = isWav ? [
-            '-i', inputPath,  // If it's WAV, let ffmpeg detect format
-        ] : [
-            '-f', 's16le',     // Raw PCM
-            '-ar', '24000',    // Assume 24kHz
-            '-ac', '1',        // Mono
-            '-i', inputPath,
-        ];
-
-        const ffmpeg = spawn('ffmpeg', [
-            ...ffmpegArgs,
-            '-ar', '48000',    // Discord sample rate
-            '-ac', '2',        // Stereo for Discord
-            '-acodec', 'pcm_s16le',
-            '-f', 'wav',
-            outputPath,
-            '-y',
-            '-loglevel', 'error'
-        ]);
-
-        ffmpeg.on('close', (code) => {
-            try {
-                if (code === 0) {
-                    const discordBuffer = readFileSync(outputPath);
-                    unlinkSync(inputPath);
-                    unlinkSync(outputPath);
-                    resolve(discordBuffer);
-                } else {
-                    reject(new Error(`FFmpeg failed with code ${code}`));
-                }
-            } catch (err) {
-                reject(err);
-            }
+        // Create an FFmpeg instance using Prism to transcode ON THE FLY
+        // Input: 24kHz Mono (Gemini default) -> Output: 48kHz Stereo (Discord)
+        const ffmpeg = new prism.FFmpeg({
+            args: [
+                '-analyzeduration', '0',
+                '-loglevel', '0',
+                '-f', 's16le',
+                '-ar', '24000',
+                '-ac', '1',
+                '-i', '-',
+                '-f', 's16le',
+                '-ar', '48000',
+                '-ac', '2',
+            ],
         });
-    });
+
+        // Pipe our input stream into FFmpeg
+        aiInputStream.pipe(ffmpeg);
+
+        // Create a Discord AudioResource from the FFmpeg output
+        const resource = createAudioResource(ffmpeg, {
+            inputType: StreamType.Raw,
+            inlineVolume: true
+        });
+
+        // Play it immediately
+        guildState.player.play(resource);
+
+        // Handle stream cleanup when the AI stops speaking or audio ends
+        resource.playStream.on('end', () => {
+            console.log("Audio resource ended");
+            aiInputStream = undefined;
+        });
+    }
+
+    // 2. Simply write the new chunk to the existing stream
+    // The player will pick this up automatically because everything is piped
+    aiInputStream.write(chunk);
 }
 
-let sessionReady = false;
 async function initAiSession() {
     const ai = new GoogleGenAI({
         apiKey: process.env['GEMINI_API_KEY'],
@@ -120,7 +124,6 @@ async function initAiSession() {
         callbacks: {
             onopen() {
                 console.debug('AI Session Opened');
-                sessionReady = true;
             },
             onmessage(message: LiveServerMessage) {
                 // NEW: Process chunks directly as they arrive from the AI!
@@ -136,107 +139,11 @@ async function initAiSession() {
         config,
     })
 
-    while (!sessionReady) {
+    while (!session) {
         await new Promise(r => setTimeout(r, 100));
     }
 
     return session
-}
-
-// Discord Bot Setup
-const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildVoiceStates,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-    ],
-})
-
-interface GuildConnectionState {
-    connection: VoiceConnection
-    player: ReturnType<typeof createAudioPlayer>
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    audioStreams: Map<string, any>
-    audioQueue: Buffer[]      // <-- NEW
-    isPlaying: boolean        // <-- NEW
-}
-
-const connections = new Map<string, GuildConnectionState>()
-
-client.once(Events.ClientReady, readyClient => {
-    console.log(`Ready! Logged in as ${readyClient.user.tag}`)
-})
-
-client.on(Events.InteractionCreate, async interaction => {
-    if (!interaction.isChatInputCommand()) return
-
-    if (interaction.commandName === 'join') {
-        await handleJoin(interaction)
-    } else if (interaction.commandName === 'leave') {
-        await handleLeave(interaction)
-    }
-})
-
-async function handleJoin(interaction: CommandInteraction<CacheType>) {
-    const member = interaction.member as GuildMember
-    const voiceChannel = member.voice.channel
-
-    if (!voiceChannel) {
-        return interaction.reply('Please join a voice channel first!')
-    }
-
-    const existing = getVoiceConnection(voiceChannel.guild.id)
-    if (existing) {
-        return interaction.reply('Already connected to a voice channel!')
-    }
-
-    try {
-        const connection = joinVoiceChannel({
-            channelId: voiceChannel.id,
-            guildId: voiceChannel.guild.id,
-            adapterCreator: voiceChannel.guild.voiceAdapterCreator,
-            selfDeaf: false,
-            selfMute: false,
-        })
-
-        // Wait for connection to be ready
-        await entersState(connection, VoiceConnectionStatus.Ready, 30_000)
-
-        const player = createAudioPlayer()
-        connection.subscribe(player)
-
-        const guildState: GuildConnectionState = {
-            connection,
-            player,
-            audioStreams: new Map(),
-            audioQueue: [],       // <-- NEW
-            isPlaying: false      // <-- NEW
-        }
-        connections.set(voiceChannel.guild.id, guildState)
-
-        // NEW: Automatically play the next chunk when idle
-        player.on(AudioPlayerStatus.Idle, () => {
-            guildState.isPlaying = false;
-            playNext(guildState);
-        })
-
-        player.on('error', error => {
-            console.error('Audio player error:', error)
-            guildState.isPlaying = false;
-            playNext(guildState);
-        })
-        // Initialize AI session and start listening immediately
-        await initAiSession()
-        startAudioReceiving(guildState)
-
-        await interaction.reply(
-            `✅ Joined **${voiceChannel.name}** and started listening! The AI is now active in the channel.`,
-        )
-    } catch (error) {
-        console.error('Failed to join voice channel:', error)
-        await interaction.reply('❌ Failed to join voice channel!')
-    }
 }
 
 function startAudioReceiving(guildState: GuildConnectionState) {
@@ -310,44 +217,8 @@ async function processAudioStream(audioStream: any) {
     }
 }
 
-async function trimSilence(pcmBuffer: Buffer): Promise<Buffer> {
-    const samples = new Int16Array(pcmBuffer.buffer, pcmBuffer.byteOffset, pcmBuffer.length / 2);
-
-    // Calculate RMS energy for each 10ms frame
-    const frameSize = 480; // 10ms @ 48kHz
-    const energies: number[] = [];
-
-    for (let i = 0; i < samples.length; i += frameSize) {
-        const frame = samples.slice(i, Math.min(i + frameSize, samples.length));
-        let sum = 0;
-        for (let j = 0; j < frame.length; j++) {
-            sum += frame[j] * frame[j];
-        }
-        const rms = Math.sqrt(sum / frame.length);
-        energies.push(rms);
-    }
-
-    // Find speech threshold (adjust as needed)
-    const maxEnergy = Math.max(...energies);
-    const threshold = maxEnergy * 0.05; // 5% of peak
-
-    // Find first frame above threshold
-    let startFrame = 0;
-    for (let i = 0; i < energies.length; i++) {
-        if (energies[i] > threshold) {
-            startFrame = Math.max(0, i - 2); // Include 20ms before speech
-            break;
-        }
-    }
-
-    // Convert frame index to byte index
-    const startByte = startFrame * frameSize * 2;
-
-    return pcmBuffer.slice(startByte);
-}
-
 async function sendAudioToAi(audioBuffer: Buffer) {
-    if (!session || !sessionReady || isProcessing) {
+    if (!session || isProcessing) {
         console.log('Session not ready, dropping audio');
         return;
     }
@@ -355,15 +226,13 @@ async function sendAudioToAi(audioBuffer: Buffer) {
     try {
         isProcessing = true;
 
-        // VAD - only send actual speech
-        const speechBuffer = await trimSilence(audioBuffer);
 
-        if (speechBuffer.length < 160) { // Less than 10ms of audio
+        if (audioBuffer.length < 160) { // Less than 10ms of audio
             console.log('Audio too short, skipping');
             return;
         }
         // Convert to 16kHz PCM for Gemini
-        const pcmBuffer = await convertPcmToWavFFmpeg(speechBuffer);
+        const pcmBuffer = await convertPcmToWavFFmpeg(audioBuffer);
 
         // Truncate if too long (Gemini has limits)
         const MAX_AUDIO_SIZE = 48000 * 30; // 30 seconds at 16kHz
@@ -387,7 +256,6 @@ async function sendAudioToAi(audioBuffer: Buffer) {
                 data: finalBuffer.toString('base64'),
             }
         });
-        session.sendClientContent({ turnComplete: true });
 
     } catch (error) {
         console.error('Error sending audio to AI:', error);
@@ -396,38 +264,62 @@ async function sendAudioToAi(audioBuffer: Buffer) {
     }
 }
 
-function playAudioResponse(audioBuffer: Buffer) {
-    const connections_list = Array.from(connections.entries())
-    if (connections_list.length === 0) return
 
-    const [_, guildState] = connections_list[0]
+async function handleJoin(interaction: CommandInteraction<CacheType>) {
+    const member = interaction.member as GuildMember
+    const voiceChannel = member.voice.channel
 
-    // Add to queue and attempt to play
-    guildState.audioQueue.push(audioBuffer);
-    playNext(guildState);
-}
+    if (!voiceChannel) {
+        return interaction.reply('Please join a voice channel first!')
+    }
 
+    const existing = getVoiceConnection(voiceChannel.guild.id)
+    if (existing) {
+        return interaction.reply('Already connected to a voice channel!')
+    }
 
-function playNext(guildState: GuildConnectionState) {
-    if (guildState.isPlaying || guildState.audioQueue.length === 0) return;
+    try {
+        const connection = joinVoiceChannel({
+            channelId: voiceChannel.id,
+            guildId: voiceChannel.guild.id,
+            adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+            selfDeaf: false,
+            selfMute: false,
+        })
 
-    const { player } = guildState;
-    if (!player) return;
+        // Wait for connection to be ready
+        await entersState(connection, VoiceConnectionStatus.Ready, 30_000)
 
-    guildState.isPlaying = true;
-    const audioBuffer = guildState.audioQueue.shift()!;
+        const player = createAudioPlayer()
+        connection.subscribe(player)
 
-    console.log(`Playing audio chunk... (${guildState.audioQueue.length} remaining in queue)`);
+        const guildState: GuildConnectionState = {
+            connection,
+            player,
+            audioStreams: new Map(),
+            audioQueue: [], // You can remove this
+            isPlaying: false // You can remove this
+        }
 
-    // Convert the Buffer into a Readable stream so Discord can play it
-    const stream = Readable.from(audioBuffer);
+        connections.set(voiceChannel.guild.id, guildState)
 
-    const resource = createAudioResource(stream, {
-        inlineVolume: true,
-        inputType: 'arbitrary', // arbitrary is fine since it's a valid WAV from your FFmpeg conversion
-    });
+        player.on('error', error => {
+            console.error('Audio player error:', error)
+        })
 
-    player.play(resource);
+        await initAiSession()
+        session?.sendClientContent({
+            turns: "Hello bro, lets talk"
+        })
+        startAudioReceiving(guildState)
+
+        await interaction.reply(
+            `✅ Joined **${voiceChannel.name}** and started listening! The AI is now active in the channel.`,
+        )
+    } catch (error) {
+        console.error('Failed to join voice channel:', error)
+        await interaction.reply('❌ Failed to join voice channel!')
+    }
 }
 
 async function handleLeave(interaction: CommandInteraction<CacheType>) {
@@ -499,6 +391,42 @@ async function convertPcmToWavFFmpeg(pcmBuffer: Buffer): Promise<Buffer> {
         });
     });
 }
+
+
+interface GuildConnectionState {
+    connection: VoiceConnection
+    player: ReturnType<typeof createAudioPlayer>
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    audioStreams: Map<string, any>
+    audioQueue: Buffer[]      // <-- NEW
+    isPlaying: boolean        // <-- NEW
+}
+
+const connections = new Map<string, GuildConnectionState>()
+
+// Discord Bot Setup
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildVoiceStates,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+    ],
+})
+
+client.on(Events.InteractionCreate, async interaction => {
+    if (!interaction.isChatInputCommand()) return
+
+    if (interaction.commandName === 'join') {
+        await handleJoin(interaction)
+    } else if (interaction.commandName === 'leave') {
+        await handleLeave(interaction)
+    }
+})
+
+client.once(Events.ClientReady, readyClient => {
+    console.log(`Ready! Logged in as ${readyClient.user.tag}`)
+})
 
 // Start the bot
 await client.login(process.env['TOKEN'])
