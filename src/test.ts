@@ -1,30 +1,25 @@
 import type { VoiceConnection } from '@discordjs/voice'
 import type { LiveServerMessage, Session } from '@google/genai'
 import type { CommandInteraction, GuildMember } from 'discord.js'
-import { Readable, Writable, PassThrough } from 'stream'
-import { StreamType } from '@discordjs/voice'
+
+import { AudioPlayerStatus, StreamType } from '@discordjs/voice'
 import {
     joinVoiceChannel,
     getVoiceConnection,
     createAudioPlayer,
     createAudioResource,
-    AudioPlayerStatus,
     EndBehaviorType,
     entersState,
     VoiceConnectionStatus,
 } from '@discordjs/voice'
 import { GoogleGenAI, MediaResolution, Modality } from '@google/genai'
-import { spawn } from 'child_process'
 import { Client, Events, GatewayIntentBits, type CacheType } from 'discord.js'
-import { readFileSync, unlinkSync, writeFileSync } from "fs"
 import prism from 'prism-media'
+import { Writable, PassThrough, Readable } from 'stream'
 import { pipeline } from 'stream/promises'
 
-// AI Session Management
 let session: Session | undefined = undefined
 
-// Audio processing queues
-let isProcessing = false
 let aiInputStream: PassThrough | undefined = undefined
 
 async function handleModelTurn(message: LiveServerMessage) {
@@ -53,6 +48,10 @@ async function handleModelTurn(message: LiveServerMessage) {
 }
 
 function playStreamingAudio(guildState: GuildConnectionState, chunk: Buffer) {
+    if (guildState.player.state.status === AudioPlayerStatus.Idle) {
+        aiInputStream = undefined;
+    }
+
     // 1. If we don't have an active stream, create the pipeline
     if (!aiInputStream) {
         console.log("Starting new AI audio stream...");
@@ -117,6 +116,9 @@ async function initAiSession() {
                 },
             },
         },
+        systemInstruction: {
+            parts: [{ text: "You are a helpful voice assistant in a Discord call. Keep responses concise and conversational." }],
+        },
     }
 
     session = await ai.live.connect({
@@ -150,25 +152,25 @@ function startAudioReceiving(guildState: GuildConnectionState) {
     const { connection, audioStreams } = guildState
     const receiver = connection.receiver
 
-    // Create a stream for each user that speaks
+    // Listen for when users start speaking
     receiver.speaking.on('start', async (userId: string) => {
+        // Ignore the bot's own audio
+        if (userId === client.user?.id) return;
+
         console.log(`User ${userId} started speaking`)
 
+        // Create a subscription
         const audioStream = receiver.subscribe(userId, {
             end: {
                 behavior: EndBehaviorType.AfterSilence,
-                duration: 250,
+                duration: 500, // Wait 500ms of silence before deciding user is done
             },
         });
 
         audioStreams.set(userId, audioStream)
 
-        // Process the audio stream
+        // Process the stream
         await processAudioStream(audioStream)
-    })
-
-    receiver.speaking.on('end', (userId: string) => {
-        console.log(`User ${userId} stopped speaking`)
     })
 }
 
@@ -218,49 +220,37 @@ async function processAudioStream(audioStream: any) {
 }
 
 async function sendAudioToAi(audioBuffer: Buffer) {
-    if (!session || isProcessing) {
-        console.log('Session not ready, dropping audio');
+    if (!session) {
+        console.log('Session not ready');
         return;
     }
 
     try {
-        isProcessing = true;
-
-
-        if (audioBuffer.length < 160) { // Less than 10ms of audio
-            console.log('Audio too short, skipping');
+        // Filter out very short noises (< 0.5s) to prevent "Huh?" responses to clicks
+        if (audioBuffer.length < 48000 * 0.5) {
             return;
         }
-        // Convert to 16kHz PCM for Gemini
-        const pcmBuffer = await convertPcmToWavFFmpeg(audioBuffer);
 
-        // Truncate if too long (Gemini has limits)
-        const MAX_AUDIO_SIZE = 48000 * 30; // 30 seconds at 16kHz
-        let finalBuffer = pcmBuffer;
-        if (pcmBuffer.length > MAX_AUDIO_SIZE) {
-            console.log('Audio too long, truncating to 30s');
-            finalBuffer = pcmBuffer.slice(0, MAX_AUDIO_SIZE);
-        }
+        // 1. Convert 48k -> 16k in memory (Fast!)
+        const pcm16k = await convertAudioTo16k(audioBuffer);
+        const silenceBuffer = Buffer.alloc(32000); // Zero-filled buffer = Silence
+        const payload = Buffer.concat([pcm16k, silenceBuffer]);
 
-        // Gemini expects LINEAR16 PCM with specific format
-        // Send as base64 encoded PCM, not WAV
-        console.log('Sending audio to AI:', {
-            bufferLength: finalBuffer.length,
-            durationMs: Math.round((finalBuffer.length / 2) / 16), // samples / 16 = ms
-        });
+        console.log(`Sending ${pcm16k.length} bytes to AI...`);
 
-        // Send as raw PCM with correct MIME type
+        // 2. Send to Gemini
         session.sendRealtimeInput({
             audio: {
                 mimeType: 'audio/pcm;rate=16000',
-                data: finalBuffer.toString('base64'),
+                data: payload.toString('base64'),
             }
         });
 
+        // Note: We do NOT need to tell Gemini to "reply". 
+        // Sending a chunk of audio after silence naturally triggers the VAD (Voice Activity Detection) in the model.
+
     } catch (error) {
         console.error('Error sending audio to AI:', error);
-    } finally {
-        isProcessing = false;
     }
 }
 
@@ -353,42 +343,41 @@ async function handleLeave(interaction: CommandInteraction<CacheType>) {
     await interaction.reply('👋 Left voice channel and stopped listening!')
 }
 
-async function convertPcmToWavFFmpeg(pcmBuffer: Buffer): Promise<Buffer> {
+async function convertAudioTo16k(inputBuffer: Buffer): Promise<Buffer> {
     return new Promise((resolve, reject) => {
-        const inputPath = 'temp_input_' + Date.now() + '.pcm';
-        const outputPath = 'temp_output_' + Date.now() + '.pcm';
+        // 1. Create a stream from the existing buffer
+        const inputStream = Readable.from(inputBuffer);
 
-        writeFileSync(inputPath, pcmBuffer);
+        // 2. Create an FFmpeg transform stream
+        const ffmpeg = new prism.FFmpeg({
+            args: [
+                '-analyzeduration', '0',
+                '-loglevel', '0',
+                '-f', 's16le',
+                '-ar', '48000', // Input: Discord 48k
+                '-ac', '1',     // Input: Mono
+                '-i', '-',
+                '-f', 's16le',
+                '-ar', '16000', // Output: Gemini 16k
+                '-ac', '1',     // Output: Mono
+            ],
+        });
 
-        const ffmpeg = spawn('ffmpeg', [
-            '-f', 's16le',
-            '-ar', '48000',     // Input: 48kHz from Discord
-            '-ac', '1',          // Mono
-            '-i', inputPath,
-            '-ar', '16000',      // Output: 16kHz for Gemini
-            '-ac', '1',          // Keep mono
-            '-f', 's16le',       // Raw PCM output (no WAV header)
-            '-acodec', 'pcm_s16le',
-            outputPath,
-            '-y',
-            '-loglevel', 'error' // Reduce noise
-        ]);
-
-        ffmpeg.on('close', (code) => {
-            try {
-                const convertedBuffer = readFileSync(outputPath);
-                unlinkSync(inputPath);
-                unlinkSync(outputPath);
-
-                if (code === 0) {
-                    resolve(convertedBuffer);
-                } else {
-                    reject(new Error(`FFmpeg failed with code ${code}`));
-                }
-            } catch (err) {
-                reject(err);
+        // 3. Collect the converted data into a new buffer
+        const chunks: Buffer[] = [];
+        const collector = new Writable({
+            write(chunk, encoding, callback) {
+                chunks.push(chunk);
+                callback();
             }
         });
+
+        // 4. Handle events
+        pipeline(inputStream, ffmpeg, collector)
+            .then(() => {
+                resolve(Buffer.concat(chunks));
+            })
+            .catch(reject);
     });
 }
 
