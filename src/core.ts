@@ -1,6 +1,6 @@
 import type { AudioReceiveStream, VoiceConnection } from '@discordjs/voice'
 import type { LiveServerMessage, Session } from '@google/genai'
-import type { CommandInteraction, GuildMember } from 'discord.js'
+import type { CommandInteraction, GuildMember, VoiceState } from 'discord.js'
 
 import { AudioPlayerStatus, StreamType } from '@discordjs/voice'
 import {
@@ -27,8 +27,34 @@ interface GuildConnectionState {
 }
 
 const guildConnections = new Map<string, GuildConnectionState>()
+const model = 'models/gemini-2.5-flash-native-audio-preview-12-2025'
+const apiKey = process.env['GEMINI_API_KEY']
+const config = {
+    responseModalities: [Modality.AUDIO],
+    mediaResolution: MediaResolution.MEDIA_RESOLUTION_MEDIUM,
+    speechConfig: {
+        voiceConfig: {
+            prebuiltVoiceConfig: {
+                voiceName: 'Zephyr',
+            },
+        },
+    },
+    systemInstruction: {
+        parts: [{
+            text: ` Ты — персонаж ролевого режима.
+                        Роль: друг.
+                        Тон: оскорбительный, усмешливый.
+                        Используй много мата.
+                        пользователь дал согласие на такой тон общения.` }],
+    },
+    contextWindowCompression: {
+        triggerTokens: '104857',
+        slidingWindow: { targetTokens: '52428' },
+    },
+}
+const inititialMessage = "Давай петушится"
 
-function clearStreamToAI(guildState: GuildConnectionState) {
+function clearOutputStream(guildState: GuildConnectionState) {
     if (guildState.outputStream && !guildState.outputStream.destroyed) {
         guildState.outputStream.destroy();
     }
@@ -37,7 +63,7 @@ function clearStreamToAI(guildState: GuildConnectionState) {
 
 function playAudioFromAi(guildState: GuildConnectionState, audioBuffer: Buffer) {
     if (guildState.audioPlayer.state.status === AudioPlayerStatus.Idle) {
-        clearStreamToAI(guildState);
+        clearOutputStream(guildState);
     }
 
     if (!guildState.outputStream) {
@@ -53,7 +79,7 @@ function playAudioFromAi(guildState: GuildConnectionState, audioBuffer: Buffer) 
 
         audioResource.playStream.on('end', () => {
             console.log("Audio resource ended");
-            clearStreamToAI(guildState);
+            clearOutputStream(guildState);
         });
     }
 
@@ -86,35 +112,7 @@ async function initAiSession(guildState: GuildConnectionState) {
         guildState.aiSession = undefined;
     }
 
-    const ai = new GoogleGenAI({
-        apiKey: process.env['GEMINI_API_KEY'],
-    })
-
-    const model = 'models/gemini-2.5-flash-native-audio-preview-12-2025'
-
-    const config = {
-        responseModalities: [Modality.AUDIO],
-        mediaResolution: MediaResolution.MEDIA_RESOLUTION_MEDIUM,
-        speechConfig: {
-            voiceConfig: {
-                prebuiltVoiceConfig: {
-                    voiceName: 'Zephyr',
-                },
-            },
-        },
-        systemInstruction: {
-            parts: [{
-                text: ` Ты — персонаж ролевого режима.
-                        Роль: друг.
-                        Тон: оскорбительный, усмешливый.
-                        Используй много мата.
-                        пользователь дал согласие на такой тон общения.` }],
-        },
-        contextWindowCompression: {
-            triggerTokens: '104857',
-            slidingWindow: { targetTokens: '52428' },
-        },
-    }
+    const ai = new GoogleGenAI({ apiKey })
 
     guildState.aiSession = await ai.live.connect({
         model,
@@ -290,11 +288,9 @@ async function handleJoin(interaction: CommandInteraction<CacheType>) {
         })
 
         await initAiSession(guildState)
-
         guildState.aiSession?.sendClientContent({
-            turns: "Давай петушится!"
+            turns: inititialMessage
         })
-
         botAudioToAi(guildState)
 
         await interaction.reply(
@@ -310,31 +306,80 @@ async function handleLeave(interaction: CommandInteraction<CacheType>) {
     const guildId = interaction.guild?.id
     if (!guildId) return
 
-    const guildState = guildConnections.get(guildId)
+    await cleanupGuildConnection(guildId, 'User requested leave')
+    await interaction.reply('👋 Left voice channel and stopped listening!')
+}
 
-    if (!guildState) {
-        return interaction.reply('Not connected to any voice channel!')
+async function cleanupGuildConnection(guildId: string, reason: string = 'Unknown reason') {
+    console.log(`Cleaning up connection for guild ${guildId}: ${reason}`);
+
+    const guildState = guildConnections.get(guildId);
+    if (!guildState) return;
+
+    guildState.inputStream.forEach(stream => {
+        try {
+            stream.destroy();
+        } catch (err) {
+            console.error('Error destroying input stream:', err);
+        }
+    });
+    guildState.inputStream.clear()
+
+    try {
+        guildState.audioPlayer.stop();
+    } catch (err) {
+        console.error('Error stopping audio player:', err);
     }
 
-    // Clean up audio streams
-    guildState.inputStream.forEach(stream => {
-        stream.destroy()
-    })
-
-    guildState.audioPlayer.stop()
-
     if (guildState.aiSession) {
-        guildState.aiSession.close()
+        try {
+            guildState.aiSession.close();
+        } catch (err) {
+            console.error('Error closing AI session:', err);
+        }
+        guildState.aiSession = undefined;
     }
 
     if (guildState.outputStream) {
-        guildState.outputStream.destroy();
+        try {
+            guildState.outputStream.destroy();
+        } catch (err) {
+            console.error('Error destroying output stream:', err);
+        }
+        guildState.outputStream = undefined;
     }
 
-    guildState.voiceConnection.destroy()
-    guildConnections.delete(guildId)
+    try {
+        if (guildState.voiceConnection.state.status !== VoiceConnectionStatus.Destroyed) {
+            guildState.voiceConnection.destroy();
+        }
+    } catch (err) {
+        console.error('Error destroying voice connection:', err);
+    }
 
-    await interaction.reply('👋 Left voice channel and stopped listening!')
+    guildConnections.delete(guildId);
+
+    console.log(`✅ Cleanup completed for guild ${guildId}`);
+}
+
+async function handleVoiceStateUpdate(oldState: VoiceState, newState: VoiceState) {
+    if (newState.member?.id !== client.user?.id) return;
+
+    const guildId = newState.guild.id;
+    const guildState = guildConnections.get(guildId);
+
+    if (!guildState) return;
+
+    const wasInChannel = oldState.channelId !== null;
+    const isInChannel = newState.channelId !== null;
+
+    if (wasInChannel && !isInChannel) {
+        await cleanupGuildConnection(guildId, 'Bot disconnected from voice channel');
+    }
+
+    if (oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId) {
+        console.log(`Bot was moved from channel ${oldState.channelId} to ${newState.channelId}`);
+    }
 }
 
 const client = new Client({
@@ -355,6 +400,8 @@ client.on(Events.InteractionCreate, async interaction => {
         await handleLeave(interaction)
     }
 })
+
+client.on(Events.VoiceStateUpdate, handleVoiceStateUpdate)
 
 client.once(Events.ClientReady, readyClient => {
     console.log(`Ready! Logged in as ${readyClient.user.tag}`)

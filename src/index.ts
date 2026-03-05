@@ -4,7 +4,7 @@ import 'dotenv/config'
 
 // import { initAiStudio } from '@/aistudio'
 import { initCommands } from '@/commands'
-import 'test'
+import '@/core'
 
 // async function main() {
 //     const app = new Hono()
