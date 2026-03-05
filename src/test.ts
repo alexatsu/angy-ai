@@ -15,13 +15,13 @@ import {
 import { GoogleGenAI, MediaResolution, Modality } from '@google/genai'
 import { Client, Events, GatewayIntentBits, type CacheType } from 'discord.js'
 import prism from 'prism-media'
-import { Writable, PassThrough, Readable } from 'stream'
+import { Writable, PassThrough } from 'stream'
 import { pipeline } from 'stream/promises'
 
 let session: Session | undefined = undefined
-let aiInputStream: PassThrough | undefined = undefined
+let outputStream: PassThrough | undefined = undefined
 
-async function handleModelTurn(message: LiveServerMessage) {
+async function handleAiModelTurn(message: LiveServerMessage) {
     const parts = message.serverContent?.modelTurn?.parts
     if (!parts) {
         console.log("waiting for parts | parts missing")
@@ -30,18 +30,15 @@ async function handleModelTurn(message: LiveServerMessage) {
 
     for (const part of parts) {
         if (part.inlineData) {
-            // Gemini sends audio as base64
             const dataFromModel = () => part.inlineData?.data ?? `${console.log("no data from model")}`
             const audioBuffer = Buffer.from(dataFromModel(), 'base64');
 
-            // Get the current guild state (assuming 1 active connection for simplicity)
-            // In production, map this by guildId
-            const guildId = Array.from(connections.keys())[0];
+            const guildId = Array.from(guildConnections.keys())[0];
             if (!guildId) return;
-            const guildState = connections.get(guildId);
+            const guildState = guildConnections.get(guildId);
 
             if (guildState) {
-                playStreamingAudio(guildState, audioBuffer);
+                playAudioFromAi(guildState, audioBuffer);
             }
 
         } else if (part.text) {
@@ -51,62 +48,37 @@ async function handleModelTurn(message: LiveServerMessage) {
 }
 
 function clearAiStream() {
-    if (aiInputStream && !aiInputStream.destroyed) {
-        aiInputStream.destroy();
+    if (outputStream && !outputStream.destroyed) {
+        outputStream.destroy();
     }
-    aiInputStream = undefined;
+    outputStream = undefined;
 }
 
-function playStreamingAudio(guildState: GuildConnectionState, audioBuffer: Buffer) {
-    if (guildState.player.state.status === AudioPlayerStatus.Idle) {
-        clearAiStream()
+function playAudioFromAi(guildState: GuildConnectionState, audioBuffer: Buffer) {
+    if (guildState.audioPlayer.state.status === AudioPlayerStatus.Idle) {
+        clearAiStream();
     }
 
-    // If we don't have an active stream, create the pipeline
-    if (!aiInputStream) {
-        console.log("Starting new AI audio stream...");
+    if (!outputStream) {
+        console.log("Starting new AI audio stream ...");
 
-        // Create a generic stream to accept Gemini chunks
-        aiInputStream = new PassThrough();
+        outputStream = new PassThrough();
 
-        // Create an FFmpeg instance using Prism to transcode ON THE FLY
-        // Input: 24kHz Mono (Gemini default) -> Output: 48kHz Stereo (Discord)
-        const ffmpeg = new prism.FFmpeg({
-            args: [
-                '-analyzeduration', '0',
-                '-loglevel', '0',
-                '-f', 's16le',
-                '-ar', '24000',
-                '-ac', '1',
-                '-i', '-',
-                '-f', 's16le',
-                '-ar', '48000',
-                '-ac', '2',
-            ],
-        });
-
-        // Pipe our input stream into FFmpeg
-        aiInputStream.pipe(ffmpeg);
-
-        // Create a Discord AudioResource from the FFmpeg output
-        const resource = createAudioResource(ffmpeg, {
+        const resource = createAudioResource(outputStream, {
             inputType: StreamType.Raw,
-            inlineVolume: true
         });
 
-        // Play it immediately
-        guildState.player.play(resource);
+        guildState.audioPlayer.play(resource);
 
-        // Handle stream cleanup when the AI stops speaking or audio ends
         resource.playStream.on('end', () => {
             console.log("Audio resource ended");
-            aiInputStream = undefined;
+            clearAiStream();
         });
     }
 
-    // 2. Simply write the new chunk to the existing stream
-    // The player will pick this up automatically because everything is piped
-    aiInputStream.write(audioBuffer);
+    const readyForDiscordBuffer = upsample24MonoTo48Stereo(audioBuffer);
+
+    outputStream.write(readyForDiscordBuffer);
 }
 
 async function initAiSession() {
@@ -132,7 +104,16 @@ async function initAiSession() {
             },
         },
         systemInstruction: {
-            parts: [{ text: "You are a helpful voice assistant in a Discord call. Keep responses concise and conversational." }],
+            parts: [{
+                text: ` Ты — персонаж ролевого режима.
+                        Роль: друг.
+                        Тон: оскорбительный, усмешливый.
+                        Используй много мата.
+                        пользователь дал согласие на такой тон общения.` }],
+        },
+        contextWindowCompression: {
+            triggerTokens: '104857',
+            slidingWindow: { targetTokens: '52428' },
         },
     }
 
@@ -143,7 +124,7 @@ async function initAiSession() {
                 console.debug('AI Session Opened');
             },
             onmessage(message: LiveServerMessage) {
-                handleModelTurn(message).catch(console.error);
+                handleAiModelTurn(message).catch(console.error);
             },
             onerror(e: ErrorEvent) {
                 console.debug('AI Error:', e.message);
@@ -162,129 +143,123 @@ async function initAiSession() {
     return session
 }
 
-function startAudioReceiving(guildState: GuildConnectionState) {
-    const { connection, audioStreams } = guildState
-    const receiver = connection.receiver
+function discordBotAudioReceiver(guildState: GuildConnectionState) {
+    const { voiceConnection, inputStream} = guildState
+    const receiver = voiceConnection.receiver
 
-    // Listen for when users start speaking
     receiver.speaking.on('start', async (userId: string) => {
-        // Ignore the bot's own audio
         if (userId === client.user?.id) return;
 
-        const existing = audioStreams.get(userId);
-        if (existing) {
-            if (!existing.destroyed) existing.destroy();
-            audioStreams.delete(userId);
+        const existingStream = inputStream.get(userId);
+        if (existingStream && !existingStream.destroyed) {
+            return;
         }
 
-        console.log(`User ${userId} started speaking`)
-
-        // Create a subscription
-        const subscribedReceiver = receiver.subscribe(userId, {
+        const botReceiver = receiver.subscribe(userId, {
             end: {
-                behavior: EndBehaviorType.AfterSilence,
-                duration: 500, // Wait 500ms of silence before deciding user is done
+                behavior: EndBehaviorType.AfterSilence, duration: 200,
             },
         });
 
-        audioStreams.set(userId, subscribedReceiver)
 
-        subscribedReceiver.once("end", () => {
-            if (audioStreams.get(userId) === subscribedReceiver) {
-                audioStreams.delete(userId);
+        console.log(`User ${userId} started speaking`)
+
+        inputStream.set(userId, botReceiver)
+
+        botReceiver.once("end", () => {
+            if (inputStream.get(userId) === botReceiver) {
+                inputStream.delete(userId);
             }
         });
 
-        // Process the stream
-        await processAudioStream(subscribedReceiver)
+        await processAudioForAi(botReceiver)
     })
 }
 
-async function processAudioStream(audioStream: AudioReceiveStream) {
-    const pcmChunks: Buffer[] = []
+function downsample48To16(buffer: Buffer): Buffer {
+    const outLength = Math.floor(buffer.length / 3);
+    const adjustedLength = outLength % 2 === 0 ? outLength : outLength - 1; // Keep 16-bit alignment
+    const outBuffer = Buffer.allocUnsafe(adjustedLength);
 
-    // Create decoder
-    const decoder = new prism.opus.Decoder({
-        channels: 1,
+    let outIdx = 0;
+    for (let i = 0; i < buffer.length - 1; i += 6) { // 6 bytes = 3 samples of 16-bit audio
+        outBuffer.writeInt16LE(buffer.readInt16LE(i), outIdx);
+        outIdx += 2;
+    }
+    return outBuffer.subarray(0, outIdx);
+}
+
+function upsample24MonoTo48Stereo(input: Buffer): Buffer {
+    // Ensure we don't read half a sample if the chunk size is odd
+    const safeLength = input.length - (input.length % 2);
+
+    // Output will be 4x the size (2x for stereo, 2x for sample rate)
+    const out = Buffer.allocUnsafe(safeLength * 4);
+
+    let outIdx = 0;
+    for (let i = 0; i < safeLength; i += 2) {
+        const sample = input.readInt16LE(i);
+
+        // Frame 1 (Left and Right channels)
+        out.writeInt16LE(sample, outIdx);       // L
+        out.writeInt16LE(sample, outIdx + 2);   // R
+
+        // Frame 2 (Duplicated to double the sample rate from 24k to 48k)
+        out.writeInt16LE(sample, outIdx + 4);   // L
+        out.writeInt16LE(sample, outIdx + 6);   // R
+
+        outIdx += 8;
+    }
+    return out;
+}
+
+async function processAudioForAi(botReceiver: AudioReceiveStream) {
+    if (!session) return;
+
+    const opusDecoder = new prism.opus.Decoder({
         rate: 48000,
+        channels: 1,
         frameSize: 960,
-    })
-
-    const MAX_BUFFER_SIZE = 20 * 1024 * 1024; // 20MB cap
-    let currentSize = 0;
+    });
 
     const pcmCollector = new Writable({
         write(chunk: Buffer, encoding, callback) {
-            if (currentSize + chunk.length > MAX_BUFFER_SIZE) {
-                audioStream.destroy();
-                return callback(new Error('Buffer limit exceeded'));
+            if (!session) return callback();
+
+            const resampled = downsample48To16(chunk);
+
+            try {
+                session.sendRealtimeInput({
+                    audio: {
+                        mimeType: 'audio/pcm;rate=16000',
+                        data: resampled.toString('base64'),
+                    }
+                });
+            } catch (err) {
+                console.error("Failed to send chunk", err);
             }
-            pcmChunks.push(chunk);
-            currentSize += chunk.length;
             callback();
         },
     });
 
-    // Handle decoder errors specifically
-    decoder.on('error', (error: Error) => {
-        console.error('Decoder error:', error)
-    })
-
-    try {
-        // Pipe the audio stream through the decoder to the collector
-        await pipeline(audioStream, decoder, pcmCollector)
-    } catch (err: unknown) {
-        // ERROR HANDLING FIX:
-        // Ignore premature close errors. This happens when the user stops talking
-        // and Discord.js closes the stream, or when you manually destroy the
-        // stream in the 'speaking' event handler.
-
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const error = err as any;
-        if (error.code === 'ERR_STREAM_PREMATURE_CLOSE') {
-            // This is expected behavior for voice streams
-        } else {
-            console.error(`Error processing audio stream for user:`, error)
+    pipeline(botReceiver, opusDecoder, pcmCollector).catch((err) => {
+        if (err.code !== 'ERR_STREAM_PREMATURE_CLOSE') {
+            console.error('Pipeline error:', err);
         }
-    }
+    });
 
-    if (pcmChunks.length > 0) {
-        const completePcmData = Buffer.concat(pcmChunks)
-        console.log(`Collected ${completePcmData.length} bytes of PCM data`)
-        await sendAudioToAi(completePcmData)
-    }
-}
+    botReceiver.once('end', () => {
+        if (!session) return;
 
-async function sendAudioToAi(audioBuffer: Buffer) {
-    if (!session) {
-        console.log('Session not ready');
-        return;
-    }
-
-    try {
-        // Filter out very short noises (< 0.5s) to prevent "Huh?" responses to clicks
-        if (audioBuffer.length < 48000 * 0.5) {
-            return;
-        }
-
-        const pcm16k = await convertAudioTo16k(audioBuffer);
-        const silenceBuffer = Buffer.alloc(32000); // Zero-filled buffer = Silence
-        const payload = Buffer.concat([pcm16k, silenceBuffer]);
-
-        console.log(`Sending ${pcm16k.length} bytes to AI...`);
-
+        console.log("User stopped speaking, triggering Gemini response...");
+        const silenceBuffer = Buffer.alloc(16000);
         session.sendRealtimeInput({
             audio: {
                 mimeType: 'audio/pcm;rate=16000',
-                data: payload.toString('base64'),
+                data: silenceBuffer.toString('base64'),
             }
         });
-
-        // Note: We do NOT need to tell Gemini to "reply". 
-        // Sending a chunk of audio after silence naturally triggers the VAD (Voice Activity Detection) in the model.
-    } catch (error) {
-        console.error('Error sending audio to AI:', error);
-    }
+    });
 }
 
 async function handleJoin(interaction: CommandInteraction<CacheType>) {
@@ -301,7 +276,7 @@ async function handleJoin(interaction: CommandInteraction<CacheType>) {
     }
 
     try {
-        const connection = joinVoiceChannel({
+        const botVoiceChannel = joinVoiceChannel({
             channelId: voiceChannel.id,
             guildId: voiceChannel.guild.id,
             adapterCreator: voiceChannel.guild.voiceAdapterCreator,
@@ -309,19 +284,18 @@ async function handleJoin(interaction: CommandInteraction<CacheType>) {
             selfMute: false,
         })
 
-        // Wait for connection to be ready
-        await entersState(connection, VoiceConnectionStatus.Ready, 30_000)
+        await entersState(botVoiceChannel, VoiceConnectionStatus.Ready, 30_000)
 
         const player = createAudioPlayer()
-        connection.subscribe(player)
+        botVoiceChannel.subscribe(player)
 
         const guildState: GuildConnectionState = {
-            connection,
-            player,
-            audioStreams: new Map(),
+            voiceConnection: botVoiceChannel,
+            audioPlayer: player,
+            inputStream: new Map(),
         }
 
-        connections.set(voiceChannel.guild.id, guildState)
+        guildConnections.set(voiceChannel.guild.id, guildState)
 
         player.on('error', error => {
             console.error('Audio player error:', error)
@@ -329,9 +303,9 @@ async function handleJoin(interaction: CommandInteraction<CacheType>) {
 
         await initAiSession()
         session?.sendClientContent({
-            turns: "Привет, поговори с нами"
+            turns: "Давай петушится!"
         })
-        startAudioReceiving(guildState)
+        discordBotAudioReceiver(guildState)
 
         await interaction.reply(
             `✅ Joined **${voiceChannel.name}** and started listening! The AI is now active in the channel.`,
@@ -346,19 +320,19 @@ async function handleLeave(interaction: CommandInteraction<CacheType>) {
     const guildId = interaction.guild?.id
     if (!guildId) return
 
-    const guildState = connections.get(guildId)
+    const guildState = guildConnections.get(guildId)
 
     if (!guildState) {
         return interaction.reply('Not connected to any voice channel!')
     }
 
     // Clean up audio streams
-    guildState.audioStreams.forEach(stream => {
+    guildState.inputStream.forEach(stream => {
         stream.destroy()
     })
 
     // Stop player
-    guildState.player.stop()
+    guildState.audioPlayer.stop()
 
     // Close AI session
     if (session) {
@@ -367,62 +341,24 @@ async function handleLeave(interaction: CommandInteraction<CacheType>) {
     }
 
     // Destroy connection
-    guildState.connection.destroy()
-    connections.delete(guildId)
+    guildState.voiceConnection.destroy()
+    guildConnections.delete(guildId)
 
-    if (aiInputStream) {
-        aiInputStream.destroy();
-        aiInputStream = undefined;
+    if (outputStream) {
+        outputStream.destroy();
+        outputStream = undefined;
     }
 
     await interaction.reply('👋 Left voice channel and stopped listening!')
 }
 
-async function convertAudioTo16k(inputBuffer: Buffer): Promise<Buffer> {
-    return new Promise((resolve, reject) => {
-        // 1. Create a stream from the existing buffer
-        const inputStream = Readable.from(inputBuffer);
-
-        // 2. Create an FFmpeg transform stream
-        const ffmpeg = new prism.FFmpeg({
-            args: [
-                '-analyzeduration', '0',
-                '-loglevel', '0',
-                '-f', 's16le',
-                '-ar', '48000', // Input: Discord 48k
-                '-ac', '1',     // Input: Mono
-                '-i', '-',
-                '-f', 's16le',
-                '-ar', '16000', // Output: Gemini 16k
-                '-ac', '1',     // Output: Mono
-            ],
-        });
-
-        // 3. Collect the converted data into a new buffer
-        const chunks: Buffer[] = [];
-        const collector = new Writable({
-            write(chunk, encoding, callback) {
-                chunks.push(chunk);
-                callback();
-            }
-        });
-
-        // 4. Handle events
-        pipeline(inputStream, ffmpeg, collector)
-            .then(() => {
-                resolve(Buffer.concat(chunks));
-            })
-            .catch(reject);
-    });
-}
-
 interface GuildConnectionState {
-    connection: VoiceConnection
-    player: ReturnType<typeof createAudioPlayer>
-    audioStreams: Map<string, AudioReceiveStream>
+    voiceConnection: VoiceConnection
+    audioPlayer: ReturnType<typeof createAudioPlayer>
+    inputStream: Map<string, AudioReceiveStream>
 }
 
-const connections = new Map<string, GuildConnectionState>()
+const guildConnections = new Map<string, GuildConnectionState>()
 
 const client = new Client({
     intents: [
