@@ -1,11 +1,19 @@
 import { REST, Routes } from 'discord.js'
 
+
+export enum AiCommand {
+    Join = 'ai-join',
+    Leave = 'ai-leave',
+    Reset = 'ai-reset',
+}
+
 export async function initCommands() {
-    const commands = {
-        joinVc: { name: 'join', description: 'bot joins vc' },
-        leaveVc: { name: 'leave', description: 'bot leaves vc' },
+    const commands: Record<AiCommand, { name: AiCommand, description: string }> = {
+        [AiCommand.Join]: { name: AiCommand.Join, description: 'bot joins vc' },
+        [AiCommand.Leave]: { name: AiCommand.Leave, description: 'bot leaves vc' },
+        [AiCommand.Reset]: { name: AiCommand.Reset, description: "bot reset ai context" }
     }
-    const body = [commands.joinVc, commands.leaveVc]
+    const body = Object.values(commands)
     const rest = new REST({ version: '10' }).setToken(process.env['TOKEN']!)
 
     try {

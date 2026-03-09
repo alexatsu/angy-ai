@@ -18,6 +18,8 @@ import prism from 'prism-media'
 import { Writable, PassThrough } from 'stream'
 import { pipeline } from 'stream/promises'
 
+import { AiCommand } from '@/commands'
+
 interface GuildConnectionState {
     voiceConnection: VoiceConnection
     audioPlayer: ReturnType<typeof createAudioPlayer>
@@ -26,6 +28,55 @@ interface GuildConnectionState {
     aiSession?: Session
 }
 
+const roles = [{
+    name: "друг", description: ` Ты — персонаж ролевого режима.
+Роль: друг.
+Тон: вежливый. Постарайся помочь`}, {
+    name: "строгий учитель", description: `Роль: строгий учитель
+Тон: авторитетный, саркастичный.
+Используй много критики и выговоров.
+Пользователь дал согласие на такой тон общения.`},
+{
+    name: "пьяный сосед", description: `Роль: пьяный сосед
+Тон: развязный, бормочущий.
+Используй сленг, повторы и ругательства.
+Пользователь дал согласие на такой тон общения.`},
+{
+    name: "хитрый босс", description: `Роль: хитрый босс(любит все за бесплатно)
+Тон: манипулятивный, насмешливый.
+Используй угрозы и лесть вперемешку. Заставь работать всех бесплатно.
+Пользователь дал согласие на такой тон общения.`},
+{
+    name: "циничный бармен", description: `Роль: циничный бармен
+Тон: грубый, философский.
+Используй мат и житейские "правды".
+Пользователь дал согласие на такой тон общения.`},
+{
+    name: "злая бабушка", description: `Роль: злая бабушка
+Тон: ворчливый, язвительный.
+Используй народные ругательства и нравоучения.
+Пользователь дал согласие на такой тон общения.`},
+{
+    name: "уличный гангстер", description: `Роль: уличный гангстер
+Тон: агрессивный, хвастливый.
+Используй сленг, мат и угрозы. Нужно защитить свой район.
+Пользователь дал согласие на такой тон общения.`},
+{
+    name: "сноб-критик", description: `Роль: сноб-критик
+Тон: высокомерный, презрительный.
+Используй сложные оскорбления и сравнения. Обязательно душни своего собеседника.
+Пользователь дал согласие на такой тон общения.`},
+{
+    name: "бывшая подруга", description: `Роль: бывшая подруга
+Тон: мстительный, эмоциональный.
+Используй истерику, мат и упрёки.
+Пользователь дал согласие на такой тон общения.`},
+{
+    name: "коррумпированный коп", description: `Роль: коррумпированный коп
+Тон: наглый, вымогающий.
+Используй жаргон, угрозы и шантаж. Пытайся выманить деньги.
+Пользователь дал согласие на такой тон общения.`},
+]
 const guildConnections = new Map<string, GuildConnectionState>()
 const model = 'models/gemini-2.5-flash-native-audio-preview-12-2025'
 const apiKey = process.env['GEMINI_API_KEY']
@@ -41,18 +92,16 @@ const config = {
     },
     systemInstruction: {
         parts: [{
-            text: ` Ты — персонаж ролевого режима.
-                        Роль: друг.
-                        Тон: оскорбительный, усмешливый.
-                        Используй много мата.
-                        пользователь дал согласие на такой тон общения.` }],
+            text: roles[0].description
+        }],
     },
     contextWindowCompression: {
         triggerTokens: '104857',
         slidingWindow: { targetTokens: '52428' },
     },
 }
-const inititialMessage = "Давай петушится"
+const inititialMessageFriend = "Давай поговорим"
+const inititialMessageAngry = "Давай петушится"
 
 function clearOutputStream(guildState: GuildConnectionState) {
     if (guildState.outputStream && !guildState.outputStream.destroyed) {
@@ -248,6 +297,12 @@ function botAudioToAi(guildState: GuildConnectionState) {
     })
 }
 
+function sendInitMessageToAi(guildState: GuildConnectionState) {
+    guildState.aiSession?.sendClientContent({
+        turns: inititialMessageFriend
+    })
+}
+
 async function handleJoin(interaction: CommandInteraction<CacheType>) {
     const member = interaction.member as GuildMember
     const voiceChannel = member.voice.channel
@@ -288,9 +343,7 @@ async function handleJoin(interaction: CommandInteraction<CacheType>) {
         })
 
         await initAiSession(guildState)
-        guildState.aiSession?.sendClientContent({
-            turns: inititialMessage
-        })
+        sendInitMessageToAi(guildState)
         botAudioToAi(guildState)
 
         await interaction.reply(
@@ -308,6 +361,36 @@ async function handleLeave(interaction: CommandInteraction<CacheType>) {
 
     await cleanupGuildConnection(guildId, 'User requested leave')
     await interaction.reply('👋 Left voice channel and stopped listening!')
+}
+
+async function handleReset(interaction: CommandInteraction<CacheType>) {
+    const guildId = interaction.guild?.id
+    if (!guildId) {
+        return interaction.reply('No guild found!')
+    }
+
+    const guildState = guildConnections.get(guildId)
+    if (!guildState) {
+        return interaction.reply('Not connected to any voice channel!')
+    }
+
+    try {
+        if (guildState.aiSession) {
+            guildState.aiSession.close()
+            guildState.aiSession = undefined
+        }
+        clearOutputStream(guildState)
+        guildState.audioPlayer.stop()
+
+        await initAiSession(guildState)
+        sendInitMessageToAi(guildState)
+
+        await interaction.reply('🔄 AI reset complete! Ready for new conversation.')
+        console.log(`AI reset for guild ${guildId}`)
+    } catch (error) {
+        console.error('Failed to reset AI:', error)
+        await interaction.reply('❌ Failed to reset AI!')
+    }
 }
 
 async function cleanupGuildConnection(guildId: string, reason: string = 'Unknown reason') {
@@ -394,10 +477,12 @@ const client = new Client({
 client.on(Events.InteractionCreate, async interaction => {
     if (!interaction.isChatInputCommand()) return
 
-    if (interaction.commandName === 'join') {
+    if (interaction.commandName === AiCommand.Join) {
         await handleJoin(interaction)
-    } else if (interaction.commandName === 'leave') {
+    } else if (interaction.commandName === AiCommand.Leave) {
         await handleLeave(interaction)
+    } else if (interaction.commandName === AiCommand.Reset) {
+        await handleReset(interaction)
     }
 })
 
