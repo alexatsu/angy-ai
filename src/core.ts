@@ -101,7 +101,7 @@ const config = {
     },
 }
 const inititialMessageFriend = "Давай поговорим"
-const inititialMessageAngry = "Давай петушится"
+// const inititialMessageAngry = "Давай петушится"
 
 function clearOutputStream(guildState: GuildConnectionState) {
     if (guildState.outputStream && !guildState.outputStream.destroyed) {
