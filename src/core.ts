@@ -1,6 +1,6 @@
 import type { AudioReceiveStream, VoiceConnection } from '@discordjs/voice'
 import type { LiveServerMessage, Session } from '@google/genai'
-import type { CommandInteraction, GuildMember, VoiceState } from 'discord.js'
+import type { ChatInputCommandInteraction, CommandInteraction, GuildMember, VoiceState } from 'discord.js'
 
 import { AudioPlayerStatus, StreamType } from '@discordjs/voice'
 import {
@@ -24,6 +24,7 @@ interface GuildConnectionState {
     voiceConnection: VoiceConnection
     audioPlayer: ReturnType<typeof createAudioPlayer>
     inputStream: Map<string, AudioReceiveStream>
+    currentRoleIndex: number
     outputStream?: PassThrough
     aiSession?: Session
 }
@@ -77,6 +78,7 @@ const roles = [{
 Используй жаргон, угрозы и шантаж. Пытайся выманить деньги.
 Пользователь дал согласие на такой тон общения.`},
 ]
+
 const guildConnections = new Map<string, GuildConnectionState>()
 const model = 'models/gemini-2.5-flash-native-audio-preview-12-2025'
 const apiKey = process.env['GEMINI_API_KEY']
@@ -101,7 +103,7 @@ const config = {
     },
 }
 const inititialMessageFriend = "Давай поговорим"
-// const inititialMessageAngry = "Давай петушится"
+const inititialMessageAngry = "Давай петушится"
 
 function clearOutputStream(guildState: GuildConnectionState) {
     if (guildState.outputStream && !guildState.outputStream.destroyed) {
@@ -119,11 +121,9 @@ function playAudioFromAi(guildState: GuildConnectionState, audioBuffer: Buffer) 
         console.log("Starting new AI audio stream ...");
 
         guildState.outputStream = new PassThrough();
-
         const audioResource = createAudioResource(guildState.outputStream, {
             inputType: StreamType.Raw,
         });
-
         guildState.audioPlayer.play(audioResource);
 
         audioResource.playStream.on('end', () => {
@@ -147,7 +147,6 @@ async function modelTurnFromAi(guildState: GuildConnectionState, message: LiveSe
         if (part.inlineData) {
             const dataFromModel = () => part.inlineData?.data ?? `${console.log("no data from model")}`
             const audioBuffer = Buffer.from(dataFromModel(), 'base64');
-
             playAudioFromAi(guildState, audioBuffer);
         } else if (part.text) {
             console.log('AI sent text response:', part.text);
@@ -155,15 +154,12 @@ async function modelTurnFromAi(guildState: GuildConnectionState, message: LiveSe
     }
 }
 
-async function initAiSession(guildState: GuildConnectionState) {
-    if (guildState.aiSession) {
-        guildState.aiSession.close();
-        guildState.aiSession = undefined;
-    }
+async function initAiSession(guildState: GuildConnectionState): Promise<Session> {
+    clearAiSession(guildState)
 
     const ai = new GoogleGenAI({ apiKey })
 
-    guildState.aiSession = await ai.live.connect({
+    const session = await ai.live.connect({
         model,
         callbacks: {
             onopen() {
@@ -182,8 +178,14 @@ async function initAiSession(guildState: GuildConnectionState) {
         config,
     })
 
-    while (!guildState.aiSession) {
-        await new Promise(r => setTimeout(r, 100));
+    guildState.aiSession = session;
+    return session;
+}
+
+function clearAiSession(guildState: GuildConnectionState) {
+    if (guildState.aiSession) {
+        guildState.aiSession.close()
+        guildState.aiSession = undefined
     }
 }
 
@@ -334,6 +336,7 @@ async function handleJoin(interaction: CommandInteraction<CacheType>) {
             voiceConnection,
             audioPlayer,
             inputStream: new Map(),
+            currentRoleIndex: 0
         }
 
         guildConnections.set(voiceChannel.guild.id, guildState)
@@ -363,6 +366,8 @@ async function handleLeave(interaction: CommandInteraction<CacheType>) {
     await interaction.reply('👋 Left voice channel and stopped listening!')
 }
 
+
+
 async function handleReset(interaction: CommandInteraction<CacheType>) {
     const guildId = interaction.guild?.id
     if (!guildId) {
@@ -375,10 +380,7 @@ async function handleReset(interaction: CommandInteraction<CacheType>) {
     }
 
     try {
-        if (guildState.aiSession) {
-            guildState.aiSession.close()
-            guildState.aiSession = undefined
-        }
+        clearAiSession(guildState)
         clearOutputStream(guildState)
         guildState.audioPlayer.stop()
 
@@ -391,6 +393,125 @@ async function handleReset(interaction: CommandInteraction<CacheType>) {
         console.error('Failed to reset AI:', error)
         await interaction.reply('❌ Failed to reset AI!')
     }
+}
+
+async function handleVoiceStateUpdate(oldState: VoiceState, newState: VoiceState) {
+    if (newState.member?.id !== client.user?.id) return;
+
+    const guildId = newState.guild.id;
+    const guildState = guildConnections.get(guildId);
+
+    if (!guildState) return;
+
+    const wasInChannel = oldState.channelId !== null;
+    const isInChannel = newState.channelId !== null;
+
+    if (wasInChannel && !isInChannel) {
+        await cleanupGuildConnection(guildId, 'Bot disconnected from voice channel');
+    }
+
+    if (oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId) {
+        console.log(`Bot was moved from channel ${oldState.channelId} to ${newState.channelId}`);
+    }
+}
+
+async function handleRoles(interaction: CommandInteraction<CacheType>) {
+    const rolesList = roles.map((role, index) =>
+        `**${index + 1}. ${role.name}**\n${role.description}`
+    ).join('\n\n');
+
+    const rolesEmbed = {
+        title: '🎭 Available AI Roles',
+        description: `Choose a role by using \`/setrole <role_name>\`\n\n${rolesList}`,
+        color: 0x00ff00,
+        footer: { text: 'User consented to all role tones' }
+    };
+
+    await interaction.reply({ embeds: [rolesEmbed] });
+}
+
+async function handleSetRole(interaction: ChatInputCommandInteraction) {
+    const guildId = interaction.guild?.id
+    if (!guildId) {
+        return interaction.reply('No guild found!')
+    }
+
+    const guildState = guildConnections.get(guildId)
+    if (!guildState) {
+        return interaction.reply('❌ Bot is not connected to any voice channel! Use `/ai-join` first.')
+    }
+
+    const roleName = interaction.options.getString('role', true)
+
+    const selectedRole = roles.find(role =>
+        role.name.toLowerCase() === roleName.toLowerCase()
+    )
+
+    if (!selectedRole) {
+        const availableRoles = roles.map(r => `\`${r.name}\``).join(', ')
+        return interaction.reply(
+            `❌ Role "${roleName}" not found!\n\nAvailable roles: ${availableRoles}\nUse \`/ai-roles\` to see full descriptions.`
+        )
+    }
+
+    try {
+        config.systemInstruction = {
+            parts: [{
+                text: selectedRole.description
+            }]
+        }
+
+        guildState.currentRoleIndex = roles.findIndex(r => r.name === selectedRole.name)
+
+        clearAiSession(guildState)
+        clearOutputStream(guildState)
+        guildState.audioPlayer.stop()
+
+        const session = await initAiSession(guildState)
+
+        const initMessage = `Теперь ты ${selectedRole.name}. ${selectedRole.description.split('Тон:')[1]?.trim() || ''} 
+        ${guildState.currentRoleIndex === 0 ? inititialMessageFriend : inititialMessageAngry}`
+        session.sendClientContent({
+            turns: initMessage
+        })
+
+        const roleEmbed = {
+            title: '🎭 Role Changed Successfully',
+            description: `**New Role:** ${selectedRole.name}\n\n**Personality:** ${selectedRole.description}`,
+            color: 0x00ff00,
+            footer: { text: 'The AI will now respond with this new personality!' }
+        }
+
+        await interaction.reply({ embeds: [roleEmbed] })
+        console.log(`Role changed to "${selectedRole.name}" for guild ${guildId}`)
+
+    } catch (error) {
+        console.error('Failed to set role:', error)
+        await interaction.reply('❌ Failed to change AI role!')
+    }
+}
+
+async function handleCurrentRole(interaction: CommandInteraction<CacheType>) {
+    const guildId = interaction.guild?.id
+    if (!guildId) {
+        return interaction.reply('No guild found!')
+    }
+
+    const guildState = guildConnections.get(guildId)
+    if (!guildState) {
+        return interaction.reply('❌ Bot is not connected to any voice channel! Use `/ai-join` first.')
+    }
+
+    const currentRole = roles[guildState.currentRoleIndex]
+
+    const roleEmbed = {
+        title: '🎭 Current AI Role',
+        description: `**Role:** ${currentRole.name}\n\n**Personality:** ${currentRole.description}`,
+        color: 0x00ff00,
+        footer: { text: 'Use /ai-roles to see all available roles' }
+    }
+
+    await interaction.reply({ embeds: [roleEmbed] })
 }
 
 async function cleanupGuildConnection(guildId: string, reason: string = 'Unknown reason') {
@@ -414,14 +535,7 @@ async function cleanupGuildConnection(guildId: string, reason: string = 'Unknown
         console.error('Error stopping audio player:', err);
     }
 
-    if (guildState.aiSession) {
-        try {
-            guildState.aiSession.close();
-        } catch (err) {
-            console.error('Error closing AI session:', err);
-        }
-        guildState.aiSession = undefined;
-    }
+    clearAiSession(guildState)
 
     if (guildState.outputStream) {
         try {
@@ -445,26 +559,6 @@ async function cleanupGuildConnection(guildId: string, reason: string = 'Unknown
     console.log(`✅ Cleanup completed for guild ${guildId}`);
 }
 
-async function handleVoiceStateUpdate(oldState: VoiceState, newState: VoiceState) {
-    if (newState.member?.id !== client.user?.id) return;
-
-    const guildId = newState.guild.id;
-    const guildState = guildConnections.get(guildId);
-
-    if (!guildState) return;
-
-    const wasInChannel = oldState.channelId !== null;
-    const isInChannel = newState.channelId !== null;
-
-    if (wasInChannel && !isInChannel) {
-        await cleanupGuildConnection(guildId, 'Bot disconnected from voice channel');
-    }
-
-    if (oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId) {
-        console.log(`Bot was moved from channel ${oldState.channelId} to ${newState.channelId}`);
-    }
-}
-
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -483,6 +577,12 @@ client.on(Events.InteractionCreate, async interaction => {
         await handleLeave(interaction)
     } else if (interaction.commandName === AiCommand.Reset) {
         await handleReset(interaction)
+    } else if (interaction.commandName === AiCommand.Roles) {
+        await handleRoles(interaction);
+    } else if (interaction.commandName === AiCommand.SetRole) {
+        await handleSetRole(interaction);
+    } else if (interaction.commandName === AiCommand.CurrentRole) {
+        await handleCurrentRole(interaction);
     }
 })
 
