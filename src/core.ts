@@ -297,7 +297,7 @@ async function handleRoles(interaction: CommandInteraction<CacheType>) {
   await interaction.reply({ embeds: [rolesEmbed] });
 }
 
-async function handleChangeRole(interaction: ChatInputCommandInteraction) {
+async function handleSetRole(interaction: ChatInputCommandInteraction) {
   const guildId = interaction.guild?.id;
   if (!guildId) {
     return interaction.reply("No guild found!");
@@ -411,7 +411,7 @@ async function cleanupGuildConnection(guildId: string, reason: string = "Unknown
   console.log(`✅ Cleanup completed for guild ${guildId}`);
 }
 
-async function cleanupBotWhenDisconnected(oldState: VoiceState, newState: VoiceState) {
+async function handleCleanupWhenDisconnected(oldState: VoiceState, newState: VoiceState) {
   if (newState.member?.id !== client.user?.id) return;
 
   const guildId = newState.guild.id;
@@ -448,13 +448,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
   } else if (interaction.commandName === AiCommand.Roles) {
     await handleRoles(interaction);
   } else if (interaction.commandName === AiCommand.SetRole) {
-    await handleChangeRole(interaction);
+    await handleSetRole(interaction);
   } else if (interaction.commandName === AiCommand.CurrentRole) {
     await handleCurrentRole(interaction);
   }
 });
 
-client.on(Events.VoiceStateUpdate, cleanupBotWhenDisconnected);
+client.on(Events.VoiceStateUpdate, handleCleanupWhenDisconnected);
 
 client.once(Events.ClientReady, (readyClient) => {
   console.log(`Ready! Logged in as ${readyClient.user.tag}`);

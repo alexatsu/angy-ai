@@ -26,6 +26,9 @@ importers:
       dotenv:
         specifier: ^17.2.3
         version: 17.3.1
+      opus-decoder:
+        specifier: ^0.7.11
+        version: 0.7.11
       opusscript:
         specifier: ^0.1.1
         version: 0.1.1
@@ -267,6 +270,9 @@ packages:
     engines: {node: '>=18'}
     cpu: [x64]
     os: [win32]
+
+  '@eshaz/web-worker@1.2.2':
+    resolution: {integrity: sha512-WxXiHFmD9u/owrzempiDlBB1ZYqiLnm9s6aPc8AlFQalq2tKmqdmMr9GXOupDgzXtqnBipj8Un0gkIm7Sjf8mw==}
 
   '@eslint-community/eslint-utils@4.9.1':
     resolution: {integrity: sha512-phrYmNiYppR7znFEdqgfWHXR6NCkZEK7hwWDHZUjit/2/U0r6XvkDl0SYnoM51Hq7FhCGdLDT6zxCCOY1hexsQ==}
@@ -555,6 +561,9 @@ packages:
   '@vladfrangu/async_event_emitter@2.4.7':
     resolution: {integrity: sha512-Xfe6rpCTxSxfbswi/W/Pz7zp1WWSNn4A0eW4mLkQUewCrXXtMj31lCg+iQyTkh/CkusZSq9eDflu7tjEDXUY6g==}
     engines: {node: '>=v14.0.0', npm: '>=7.0.0'}
+
+  '@wasm-audio-decoders/common@9.0.7':
+    resolution: {integrity: sha512-WRaUuWSKV7pkttBygml/a6dIEpatq2nnZGFIoPTc5yPLkxL6Wk4YaslPM98OPQvWacvNZ+Py9xROGDtrFBDzag==}
 
   abbrev@1.1.1:
     resolution: {integrity: sha512-nne9/IiQ/hzIhY6pdDnbBtz7DjPTKrY00P/zvPSm5pOFkl6xuGrGnXn/VtTNNfNtAfZ9/1RtehkszU9qcTii0Q==}
@@ -1072,6 +1081,9 @@ packages:
     resolution: {integrity: sha512-6IpQ7mKUxRcZNLIObR0hz7lxsapSSIYNZJwXPGeF0mTVqGKFIXj1DQcMoT22S3ROcLyY/rz0PWaWZ9ayWmad9g==}
     engines: {node: '>= 0.8.0'}
 
+  opus-decoder@0.7.11:
+    resolution: {integrity: sha512-+e+Jz3vGQLxRTBHs8YJQPRPc1Tr+/aC6coV/DlZylriA29BdHQAYXhvNRKtjftof17OFng0+P4wsFIqQu3a48A==}
+
   opusscript@0.1.1:
     resolution: {integrity: sha512-mL0fZZOUnXdZ78woRXp18lApwpp0lF5tozJOD1Wut0dgrA9WuQTgSels/CSmFleaAZrJi/nci5KOVtbuxeWoQA==}
 
@@ -1201,6 +1213,9 @@ packages:
   signal-exit@4.1.0:
     resolution: {integrity: sha512-bzyZ1e88w9O1iNJbKnOlvYTrWPDl46O1bG0D3XInv+9tkPrxrN8jUUTiFlDkkmKWgn1M6CfIA13SuGqOa9Korw==}
     engines: {node: '>=14'}
+
+  simple-yenc@1.0.4:
+    resolution: {integrity: sha512-5gvxpSd79e9a3V4QDYUqnqxeD4HGlhCakVpb6gMnDD7lexJggSBJRBO5h52y/iJrdXRilX9UCuDaIJhSWm5OWw==}
 
   string-width@4.2.3:
     resolution: {integrity: sha512-wKyQRQpjJ0sIp62ErSZdGsjMJWsap5oRNihHhu6G7JVO/9jIB6UyevL+tXuOqrng8j/cxKTWyWUwvSTriiZz/g==}
@@ -1522,6 +1537,8 @@ snapshots:
   '@esbuild/win32-x64@0.27.3':
     optional: true
 
+  '@eshaz/web-worker@1.2.2': {}
+
   '@eslint-community/eslint-utils@4.9.1(eslint@9.39.3)':
     dependencies:
       eslint: 9.39.3
@@ -1813,6 +1830,11 @@ snapshots:
       eslint-visitor-keys: 5.0.1
 
   '@vladfrangu/async_event_emitter@2.4.7': {}
+
+  '@wasm-audio-decoders/common@9.0.7':
+    dependencies:
+      '@eshaz/web-worker': 1.2.2
+      simple-yenc: 1.0.4
 
   abbrev@1.1.1: {}
 
@@ -2359,6 +2381,10 @@ snapshots:
       type-check: 0.4.0
       word-wrap: 1.2.5
 
+  opus-decoder@0.7.11:
+    dependencies:
+      '@wasm-audio-decoders/common': 9.0.7
+
   opusscript@0.1.1: {}
 
   p-limit@3.1.0:
@@ -2456,6 +2482,8 @@ snapshots:
   signal-exit@3.0.7: {}
 
   signal-exit@4.1.0: {}
+
+  simple-yenc@1.0.4: {}
 
   string-width@4.2.3:
     dependencies:
