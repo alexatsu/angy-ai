@@ -322,6 +322,13 @@ async function handleChangeRole(interaction: ChatInputCommandInteraction) {
     config.systemInstruction = {
       parts: [{ text: selectedRole.description }],
     };
+    config.speechConfig = {
+      voiceConfig: {
+        prebuiltVoiceConfig: {
+          voiceName: selectedRole.voiceName,
+        },
+      },
+    };
     guildState.currentRoleIndex = roles.findIndex((r) => r.name === selectedRole.name);
 
     clearAiSession(guildState);
